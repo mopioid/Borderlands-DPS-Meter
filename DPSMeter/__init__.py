@@ -1,32 +1,55 @@
 from unrealsdk import *
 from Mods import ModMenu
 
-from time import time
-from typing import Sequence, Any
+import enum
+from math import inf
+from collections import deque
+from typing import Any, Deque, List, Sequence
 
 import locale
 locale.setlocale(locale.LC_ALL, '')
 
 
-_state: int = 0
-_start_epoch: float = 0.0
-_tick_epoch: float = 0.0
-_total_damage: float = 0.0
+class _State(enum.Enum):
+    OFF = enum.auto()
+    CONTINUOUS = enum.auto()
+    ACCULMULATOR_STARTED = enum.auto()
+    ACCULMULATOR_STOPPED = enum.auto()
+
+_state: _State = _State.OFF
 
 
-def _show_hud(message: Any) -> None:
+_start_epoch: float
+_total_damage: float
+_tick_epochs: Deque[float]
+_tick_totals: Deque[float]
+
+
+def _reset() -> None:
+    global _start_epoch, _total_damage, _tick_epochs, _tick_totals
+    _start_epoch = GetEngine().GetCurrentWorldInfo().TimeSeconds
+    _total_damage = 0.0
+    _tick_epochs = deque()
+    _tick_totals = deque()
+
+    RemoveHook("WillowGame.WillowPawn.AdjustDamage", "DPSMeter")
+    RemoveHook("WillowGame.WillowPlayerController.PlayerTick", "DPSMeter")
+
+
+def _show_hud(message: str) -> None:
     PC = GetEngine().GamePlayers[0].Actor
+
     HUD = PC.GetHUDMovie()
     if HUD is None:
-        RemoveHook("WillowGame.WillowPawn.AdjustDamage", "DPSMeter")
-        RemoveHook("WillowGame.WillowPlayerController.PlayerTick", "DPSMeter")
+        _reset()
+
         global _state
-        _state = 0
+        _state = _State.OFF
 
     else: HUD.AddTrainingText(
-        MessageString = str(message),
+        MessageString = message,
         TitleString = "DPS Meter",
-        Duration = float('inf'),
+        Duration = inf,
         DrawColor = (),
         HUDInitializationFrame = "",
         PausesGame = False,
@@ -35,28 +58,35 @@ def _show_hud(message: Any) -> None:
         bIsntActuallyATrainingMessage = True
     )
 
-def _hide_hud() -> None:
-    GetEngine().GamePlayers[0].Actor.GetHUDMovie().ClearTrainingText()
+
+def _player_tick_continuous(caller: UObject, function: UFunction, params: FStruct) -> bool:
+    global _total_damage
+
+    current_time = GetEngine().GetCurrentWorldInfo().TimeSeconds
+    _tick_epochs.append(current_time)
+
+    _tick_totals.append(_total_damage)
+    _total_damage = 0.0
+
+    while (current_time - _tick_epochs[0]) > _continuous_option.CurrentValue:
+        _tick_epochs.popleft()
+        _tick_totals.popleft()
+
+    elapsed_seconds = current_time - _tick_epochs[0] or inf
+
+    dps = sum(_tick_totals) / elapsed_seconds
+    _show_hud(f" {round(dps):n}")
+
+    return True
 
 
-def _update_hud() -> None:
-    global _tick_epoch
-    _tick_epoch = time()
-
-    dps = _total_damage / (_tick_epoch - _start_epoch)
-
-    _show_hud(f"Tracking DPS: {round(dps):n}")
-
-
-def _player_tick(caller: UObject, function: UFunction, params: FStruct) -> bool:
-    # global _tick_epoch
-
-    # current_time = time()
-    # if (current_time - _tick_epoch) >= 1:
-    #     _tick_epoch = current_time
-    #     _update_hud()
-
-    _update_hud()
+def _player_tick_accumulator(caller: UObject, function: UFunction, params: FStruct) -> bool:
+    elapsed_seconds = GetEngine().GetCurrentWorldInfo().TimeSeconds - _start_epoch
+    _show_hud(
+        f" Time: {elapsed_seconds:n} seconds\n"
+        f" Damage Dealt: {round(_total_damage):n}\n"
+        f" Average DPS: {round(_total_damage / elapsed_seconds):n}"
+    )
     return True
 
 
@@ -97,10 +127,17 @@ def _adjust_damage(caller: UObject, function: UFunction, params: FStruct) -> boo
     global _total_damage
     _total_damage += damage
 
-    _update_hud()
-
     return True
 
+
+_continuous_option = ModMenu.Options.Slider(
+    Caption = "Continuous Time Window",
+    Description = "The number of seconds over which DPS should be averaged in continuous mode",
+    StartingValue = 3.0, MinValue = 0.5, MaxValue = 12, Increment = 0.5
+)
+
+_continuous_keybind = ModMenu.Keybind("Show/Hide Continuous Average")
+_accumulator_keybind = ModMenu.Keybind("Start/Stop/Clear Accumulator")
 
 class DPSMeter(ModMenu.SDKMod):
     Name: str = "DPS Meter"
@@ -111,58 +148,48 @@ class DPSMeter(ModMenu.SDKMod):
 
     SaveEnabledState: ModMenu.EnabledSaveType = ModMenu.EnabledSaveType.LoadOnMainMenu
 
+    Options: Sequence[ModMenu.Options.Base] = [_continuous_option]
 
-    Keybinds: Sequence[ModMenu.Keybind] = [ModMenu.Keybind("Start/Stop Acculmulator")]
+    Keybinds: Sequence[ModMenu.Keybind] = [_continuous_keybind, _accumulator_keybind]
 
     def GameInputPressed(self, keybind: ModMenu.Keybind) -> None:
-        global _state, _start_epoch, _tick_epoch, _total_damage
+        global _state
 
-        if _state == 0:
-            _start_epoch = _tick_epoch = time()
-            _total_damage = 0.0
-            _show_hud(0)
+        if keybind is _continuous_keybind:
+            if _state is _State.CONTINUOUS:
+                _reset()
+                GetEngine().GamePlayers[0].Actor.GetHUDMovie().ClearTrainingText()
+                _state = _State.OFF
 
-            RunHook("WillowGame.WillowPawn.AdjustDamage", "DPSMeter", _adjust_damage)
-            RunHook("WillowGame.WillowPlayerController.PlayerTick", "DPSMeter", _player_tick)
+            else:
+                _reset()
+                RunHook("WillowGame.WillowPawn.AdjustDamage", "DPSMeter", _adjust_damage)
+                RunHook("WillowGame.WillowPlayerController.PlayerTick", "DPSMeter", _player_tick_continuous)
+                _state = _State.CONTINUOUS
 
-            _state = 1
+        elif keybind is _accumulator_keybind:
+            if _state is _State.ACCULMULATOR_STARTED:
+                _reset()
+                _state = _State.ACCULMULATOR_STOPPED
 
-        elif _state == 1:
-            RemoveHook("WillowGame.WillowPawn.AdjustDamage", "DPSMeter")
-            RemoveHook("WillowGame.WillowPlayerController.PlayerTick", "DPSMeter")
+            elif _state is _State.ACCULMULATOR_STOPPED:
+                GetEngine().GamePlayers[0].Actor.GetHUDMovie().ClearTrainingText()
+                _state = _State.OFF
 
-            elapsed_seconds = time() - _start_epoch
-            dps = _total_damage / elapsed_seconds
-
-            _show_hud(
-                f"Dealt {round(_total_damage):n} damage "
-                f"over {round(elapsed_seconds):n} seconds "
-                f"(average {round(dps):n} DPS)"
-            )
-
-            _state = 2
-
-        else:
-            _hide_hud()
-
-            _state = 0
+            else:
+                _reset()
+                RunHook("WillowGame.WillowPawn.AdjustDamage", "DPSMeter", _adjust_damage)
+                RunHook("WillowGame.WillowPlayerController.PlayerTick", "DPSMeter", _player_tick_accumulator)
+                _state = _State.ACCULMULATOR_STARTED
 
 
     def Enable(self) -> None:
         super().Enable()
-
-        global _state, _start_epoch, _tick_epoch, _total_damage
-        _state = 0
-        _start_epoch = 0.0
-        _tick_epoch = 0.0
-        _total_damage = 0.0
-
+        _reset()
  
     def Disable(self) -> None:
         super().Disable()
-
-        RemoveHook("WillowGame.WillowPawn.AdjustDamage", "DPSMeter")
-        RemoveHook("WillowGame.WillowPlayerController.PlayerTick", "DPSMeter")
+        _reset()
 
 
 _mod_instance = DPSMeter()
